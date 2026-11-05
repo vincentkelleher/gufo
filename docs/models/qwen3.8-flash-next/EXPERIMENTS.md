@@ -1,5 +1,30 @@
 # Qwen3.8 Flash-Next experiments
 
+## Decode optimization sweep (November 5, 2026)
+
+Strix Halo gfx1151, ROCm 10.1, Nix production build, UD-Q4_K_XL target with the
+shared Q8_0 MTP sidecar. `gufo bench -p 2048 -n 128 -d 0,4096 -r 2`, baseline
+and candidate alternating on a quiet GPU, three runs per cell. The measured
+DRAM read ceiling on this part is **228.62 GB/s** (`tools/bench/gfx1151_peak`).
+
+A decode token issues about 940 kernel launches and reads roughly 5 GB of
+weights, so it runs at ~150 GB/s. This sweep tested whether that gap is kernel
+inefficiency or launch overhead. It is launch overhead: every projection shape
+measured is already at 73-87% of the DRAM peak and no tiling variant moves it.
+
+| Experiment | Outcome |
+| --- | --- |
+| Shared expert beside the routed experts on decode (`Moe`: drop `ExpertMatrixRows` from the `overlap` gate) | **Retained.** AR tg128 29.64 → 30.01 at d0 (+1.25%), 28.94 → 29.28 at d4096 (+1.19%), 29.17 → 29.54 at d32768 (+1.27%); MTP d4096 50.60 → 51.33 (+1.44%), MTP d0 within noise. Every candidate run beat every baseline run at d0/d4096. Prefill unchanged, 96-token greedy completion byte-identical. This is the first time side-stream work runs inside a captured graph, so `Run` now sets a `capturing_` flag and `Moe` fails the pass if `hipStreamIsCapturing(side_stream_)` is not active after the fork; it never fired at any depth or mode. Design notes: `docs/models/qwen3.8-flash-next/decode/`. |
+| HC mixer down-projection prefetch 2 → 4 blocks (`HcMixQ8FusedKernel`) | Rejected. The visit order per lane is unchanged, so it is byte-exact, but tg128 is flat: 29.62 → 29.56 at d0 and 29.03 → 28.97 at d4096. `tools/bench/hc_mixer_bw.hip` explains why: the down projection already streams 193-194 GB/s at 40, 80 or 160 blocks and at either prefetch depth, so its 40-work-item phase is not occupancy or latency limited. |
+| HC mixer up-projection at 8 rows per wave instead of 16 | Rejected, and not applicable to the fused kernel. Standalone (`tools/bench/hc_mixer_bw.hip`) the shape improves 165.4 → 187.6 GB/s, but that probe has 1280 blocks. `HcMixQ8FusedKernel` has a fixed 8 waves per block, so 8 rows per wave covers only 64 of the 128 rows and the model fails with "logit distribution contains no finite values". The gain needs more blocks, not fewer rows. |
+| In-place rolling convolution history (`HistoryShiftInPlaceKernel`, replacing `HistoryShiftKernel` + `CopyKernel`) | Not retained: strictly less work (one launch and half the traffic per layer, 37 layers) and byte-exact, but not separable from noise. Six runs per arm: tg128 29.59 → 29.66 at d0 (+0.24%) and 28.95 → 29.05 at d4096 (+0.34%), with heavily overlapping ranges. Worth revisiting only alongside other launch-count reductions, where the aggregate clears the noise floor. |
+| Routed-expert GEMV tiling at one token (1/2/4/8 rows per wave) | No win. A standalone probe of the production shape (Q4_K, 640 rows, 10 experts, gate/up fused) shows a ±8% spread with an unstable ordering across two working-set sizes, so the production 2-rows-per-wave mapping is already representative. |
+
+Consequence for the remaining plan: because every projection is at 73-87% of
+the DRAM peak, the residual gap is distributed launch and ramp overhead across
+~940 kernels, worth ~0.2-1% per fusion. The larger structural levers (HC mixer
+occupancy, deeper prefetch, expert tiling) are exhausted.
+
 ## Raw completion fallback (November 4, 2026)
 
 Retained: capture the aligned prompt tail in-pass before retaining the exact
