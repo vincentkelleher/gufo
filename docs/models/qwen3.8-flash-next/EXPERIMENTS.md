@@ -1,5 +1,57 @@
 # Qwen3.8 Flash-Next experiments
 
+## Deep-context MTP gate (November 7, 2026)
+
+Retained: gate a greedy MTP chain on the cached context. The head's proposal
+confidence falls with cached context while the rate at which the target accepts
+those proposals does not, so the single 0.85 gate ended chains whose next row
+would still have been accepted. Chains now use 0.65 from 2,048 cached tokens on.
+Only the number of proposals a cycle verifies changes; every proposal is still
+verified over the full target vocabulary, so completion hashes are identical.
+
+Matched A/B, main `f07fd2fe` against the candidate, same production `release`
+preset and Nix toolchain, UD-Q4_K_XL with the shared Q8_0 MTP, `gufo bench
+--speculative mtp -p 2048 -n 128 -r 2`, three alternating rounds per arm, each
+run starting below 55 C. Medians of the three rounds, with the worst round of
+each arm in brackets:
+
+| Cached depth | Main tg (tok/s) | Candidate tg (tok/s) | Gain | ms per 128-token request |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 61.82 [61.77] | 61.83 [61.82] | +0.0% | 2,070 -> 2,070 |
+| 4,096 | 50.98 [50.91] | 52.80 [52.67] | +3.6% | 2,511 -> 2,424 |
+| 8,192 | 51.14 [51.03] | 55.08 [55.00] | +7.7% | 2,503 -> 2,324 |
+| 16,384 | 56.78 [56.77] | 59.70 [59.35] | +5.1% | 2,254 -> 2,144 |
+| 32,768 | 123.27 [122.46] | 123.72 [122.46] | +0.4% | 1,038 -> 1,035 |
+
+Every depth produced the same completion hash in both arms. The 8,192 row is
+the largest gain and the only one above both the 5% and 10 ms gate: 128 tokens
+take 2.503 s on main and 2.324 s on the candidate, 179 ms less per request. The
+arms do not overlap at 4,096-16,384: the candidate's worst round still beats
+the baseline's best by +2.8%, +7.2% and +3.5% respectively, so the gain is not
+a median-only effect.
+
+A screening sweep of the gate value behind the threshold, same harness, one run
+per cell, places the crossover between 1,024 and 2,048 cached tokens: 0.85 wins
+at d0/d512/d1024 (62.48/50.65/49.69 against 61.31/49.64/47.11) and 0.65 wins at
+d2048/d4096/d8192/d16384 (61.65/52.63/54.97/59.52 against
+58.95/50.90/51.12/56.77). 0.60 is not consistently better than 0.65 (56.11
+against 54.97 at d8192, but 58.48 against 59.52 at d16384), so the deep gate
+stays at 0.65. At 32,768 the generated text is a repeated corpus that prompt
+lookup copies (108 of 118 proposals), so the gate barely applies there: 123.47
+at 0.85 against 121.84 at 0.60.
+The `conversation` and `long-context` functional suites pass against a recorded
+main baseline in MTP mode.
+
+Rejected: the same calibration for the sampled gate (`kMtpSampledGateProbability`,
+0.95). Sampled decode is content-dominated and its seed spread swamps the gate:
+with the thinking-on preset (temperature 1.0, top-p 0.95, top-k 20) at d0/d8192,
+gate 0.95 measured 56.00/54.04 and 44.62/57.44 tok/s on seeds 42 and 7, 0.90
+measured 55.33/55.46 and 48.93/54.51, and 0.85 measured 54.76/52.64 and
+52.13/55.97. No gate value wins at both depths and the within-gate seed spread
+(11-12 tok/s at d0) exceeds every difference, so the sampled path is left
+unchanged rather than tuned on noise. Reproducing a sampled comparison needs a
+fixed corpus whose RNG stream both arms share, which the gate itself perturbs.
+
 ## Raw completion fallback (November 4, 2026)
 
 Retained: capture the aligned prompt tail in-pass before retaining the exact

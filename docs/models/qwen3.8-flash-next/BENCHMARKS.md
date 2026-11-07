@@ -6,6 +6,33 @@ Gufo `fec4759d` (October 18, 2026); llama.cpp `b11069` AR and `6fcaa16f` MTP
 (September 22–23). Positive gain favors Gufo.
 [Quality and measurement details](QUALITY.md#benchmark-method) · [Model identities](artifacts/model-identities.json)
 
+## Deep-context MTP gate, November 7, 2026
+
+Main `f07fd2fe` versus the deep-context gate candidate, Nix production builds
+from the same `release` preset and toolchain, ROCm 10.1 on the same Strix
+Halo. `gufo bench --speculative mtp -p 2048 -n 128 -r 2`, same UD-Q4_K_XL and
+shared Q8_0 MTP sidecar, three alternating rounds per arm, each run starting
+below 55 C. Values are medians of the three rounds with the worst round in
+brackets; every depth produced the same completion hash in both arms.
+
+Only decode is compared: the change bounds MTP proposal chains and does not
+touch prefill, so these rows carry no pp columns.
+
+| Mode | Depth | Main tg (tok/s) | Candidate tg (tok/s) | tg gain | ms per request |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| MTP | 0 | 61.82 [61.77] | 61.83 [61.82] | +0.0% | 2,070 -> 2,070 |
+| MTP | 4,096 | 50.98 [50.91] | 52.80 [52.67] | +3.6% | 2,511 -> 2,424 |
+| MTP | 8,192 | 51.14 [51.03] | 55.08 [55.00] | +7.7% | 2,503 -> 2,324 |
+| MTP | 16,384 | 56.78 [56.77] | 59.70 [59.35] | +5.1% | 2,254 -> 2,144 |
+| MTP | 32,768 | 123.27 [122.46] | 123.72 [122.46] | +0.4% | 1,038 -> 1,035 |
+
+The 8,192 row is the only cell above both the 5% and 10 ms gate: 128 tokens
+take 2.503 s on main and 2.324 s on the candidate. The arms do not overlap at
+4,096-16,384, so the gain is not a median-only effect. AR decode is untouched
+(the gate only bounds MTP proposal chains) and its rows are unchanged. The gate
+sweep that places the 2,048-token crossover is in
+[EXPERIMENTS.md](EXPERIMENTS.md#deep-context-mtp-gate-november-7-2026).
+
 ## PR #877 controls, November 4, 2026
 
 Pinned main `1c75887b` versus runtime candidate `e6b2a4c1`, Nix production
