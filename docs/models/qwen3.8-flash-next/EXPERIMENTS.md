@@ -34,6 +34,47 @@ reporter repeatedly writing cores. They remain advisory. Final qualification
 uses quiet, sequential controls against main `1c75887b`; variable disk
 restore timings remain explicitly inconclusive rather than a speed claim.
 
+## Decode bandwidth and dispatch sweep (November 6, 2026)
+
+Where single-user decode time goes, and which knobs are already exhausted.
+Strix Halo gfx1151, ROCm 10.1, production `release` build, UD-Q4_K_XL with the
+shared Q8_0 MTP sidecar, `gufo bench -p 2048 -n 128 -d 0,4096 -r 2`, three
+alternating rounds per arm on a quiet GPU at 40-55 C. The noise floor of that
+harness measured 29.53-29.77 tok/s across six identical runs (about 0.3%
+standard deviation, 0.8% spread), so only changes above roughly 1.5% are
+resolvable with this design.
+
+`tools/bench/gfx1151_peak` reports DRAM read 236.84 GB/s, DRAM write
+198.83 GB/s and copy 205.61 GB/s on this host. A rocprofv3 kernel trace of one
+AR decode pass (63 forwards) attributes 1976.8 ms of kernel time to 57,302
+dispatches, 909 per token, with 180.0 ms of GPU idle. Shape-derived weight
+traffic is about 6.1 GB per token including the 226 MB of GDN state
+read+write, so decode streams at roughly 196 GB/s, 83% of the measured read
+ceiling. The large dense stages are already at 96-100% of it: the stacked SSM
+input projection 228 GB/s, the output head 227, the attention q/k/v/gate
+projection 229, and the SSM output plus attention output projection 226.
+Below the ceiling: the routed-expert GEMV kernels 197-200, the shared expert
+183-205, and `HcMixQ8Fused` 161-174.
+
+| Experiment | Outcome |
+| --- | --- |
+| Decode graph replay versus plain stream dispatch | Not a lever: 29.44/29.40 against 29.47/29.79 tok/s. The steady-state inter-kernel gap is about 2.0 us over 909 dispatches per token, which is the hardware dispatch floor rather than host submission. |
+| `HcMixQ8Fused` grid 80 / 120 / 160 blocks | Not a lever: 29.67 / 29.62 / 29.51 tok/s. The down phase has 40 items and the up phase 80, so additional blocks only spin. |
+| Backoff in the fused mixer's exhausted-phase item counter (`s_sleep` 64 and 256 cycles) | Rejected: 29.29 and 26.75 tok/s against 29.62. The spinning blocks are not the limit. |
+| Up-projection prefetch depth `kAhead` 4 / 8 / 16 rows | Not a lever: 29.59 / 29.60 / 29.63 tok/s. The shape is not latency limited at 2 blocks per CU. |
+| `--draft-tokens` 1 / 2 / 5 / 6 / 7 with `--min-draft-tokens 1` | 44.65 / 50.61 / 60.45 / 59.61 / 61.91 tok/s. The shipped default of 7 is the optimum; the adaptive length controller already reaches 96% of the asymptotic `1 + p/(1-p)` limit for its measured 73% per-token acceptance. `--min-draft-tokens` above 1 is refused for this model. |
+| Draft-vocabulary prefix 65,536 / 98,304 / 131,072 / 196,608 rows | 52.4 / 61.7 / 61.0 / 58.7 tok/s. The shipped 98,304 is the optimum: a smaller prefix drops enough anchors into the full-head fallback to cost 15%, and a larger one only adds head traffic. Acceptance and draft counts are identical from 98,304 upward, so the extra rows buy nothing on this workload. |
+| Shared-expert overlap extended from prefill to 1-8 decode rows | Retained in its own change: AR 29.65 to 29.96 tok/s at d0 (+1.05%) and 29.04 to 29.31 at d4096 (+0.95%), winning all six pairwise comparisons; MTP 62.04 to 62.40 (+0.58%) and 50.80 to 51.20 (+0.79%). Greedy AR and MTP completions are byte-identical to main, including draft counts, at d0 and d32768. The new `wide_verification` regression and the other 24 runnable Flash-Next GPU checks pass, and `tests/functional/prompt_lookup.py --max-concurrency 4` passes all 37 checks with 2,209 accepted lookup tokens, covering isolated and C2/C4 greedy and sampled copies, mixed copies with new text, stops with full replay, image-backed copies and cancellation. |
+
+The remaining gap is distributed: about 1.8 ms/token of dispatch gaps across
+909 launches, roughly 1.1 ms in the routed-expert kernels, and about 1.3 ms in
+the fused HC mixer of which a material part is normalization, reduction and
+epilogue work rather than weight reads. Fusing the small per-layer kernels
+(GDN preparation/epilogue, router selection, activation quantization, MoE
+epilogue) is the only untried lever of that size: they cost about 0.8 ms of
+execution plus 0.7 ms of dispatch gaps per token, but each individual fusion is
+worth 0.3-1.5% and needs a grid-wide dependency handled inside the kernel.
+
 ## Wide prompt-lookup verification (November 1, 2026)
 
 Measured downstream, on a fork that runs Swift 1.5 IQ4_XS with its Q8_0 MTP
